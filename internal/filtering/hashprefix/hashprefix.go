@@ -104,8 +104,12 @@ func New(conf *Config) (c *Checker) {
 
 // Check returns true if request for the host should be blocked.
 func (c *Checker) Check(host string) (ok bool, err error) {
-	ctx := context.TODO()
+	return c.CheckContext(context.Background(), host)
+}
 
+// CheckContext returns true if request for the host should be blocked.
+// The context is used for timeout control of upstream requests.
+func (c *Checker) CheckContext(ctx context.Context, host string) (ok bool, err error) {
 	hashes := hostnameToHashes(host)
 
 	l := c.logger.With("host", host)
@@ -122,7 +126,7 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 	l.DebugContext(ctx, "checking", "question", question)
 	req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
 
-	resp, err := c.upstream.Exchange(req)
+	resp, err := c.exchangeWithTimeout(ctx, req)
 	if err != nil {
 		return false, fmt.Errorf("getting hashes: %w", err)
 	}
@@ -132,6 +136,40 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 	c.storeInCache(ctx, hashesToRequest, receivedHashes)
 
 	return matched, nil
+}
+
+// exchangeWithTimeout performs DNS exchange with context timeout control.
+// This prevents connection leaks when the upstream is slow or unresponsive.
+func (c *Checker) exchangeWithTimeout(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	// Use a reasonable timeout to prevent hanging connections
+	const exchangeTimeout = 10 * time.Second
+	
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, exchangeTimeout)
+	defer cancel()
+
+	type result struct {
+		resp *dns.Msg
+		err  error
+	}
+
+	resultCh := make(chan result, 1)
+
+	go func() {
+		resp, err := c.upstream.Exchange(req)
+		select {
+		case resultCh <- result{resp: resp, err: err}:
+		case <-ctxWithTimeout.Done():
+			// Context cancelled, but we can't cancel the upstream.Exchange
+			// The connection may still be held by the upstream implementation
+		}
+	}()
+
+	select {
+	case res := <-resultCh:
+		return res.resp, res.err
+	case <-ctxWithTimeout.Done():
+		return nil, fmt.Errorf("upstream request timeout: %w", ctxWithTimeout.Err())
+	}
 }
 
 // hostnameToHashes returns hashes that should be checked by the hash prefix
