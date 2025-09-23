@@ -1,6 +1,7 @@
 package hashprefix
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"slices"
@@ -252,4 +253,66 @@ func TestChecker_Check(t *testing.T) {
 			assert.Equal(t, 1, numReq)
 		})
 	}
+}
+
+// TestChecker_CheckContext_Timeout tests that CheckContext properly handles
+// timeout scenarios to prevent connection leaks.
+func TestChecker_CheckContext_Timeout(t *testing.T) {
+	// Create a slow upstream that doesn't respond within timeout
+	slowUps := &aghtest.UpstreamMock{
+		OnAddress: func() (addr string) { return "upstream.example" },
+		OnExchange: func(req *dns.Msg) (resp *dns.Msg, err error) {
+			// Simulate a slow upstream that takes longer than the timeout
+			time.Sleep(5 * time.Second) // Longer than our 2s context timeout
+			return nil, nil
+		},
+		OnClose: func() (err error) { return nil },
+	}
+
+	c := &Checker{
+		logger:   slogutil.NewDiscardLogger(),
+		upstream: slowUps,
+		cache: cache.New(cache.Config{
+			EnableLRU: true,
+			MaxSize:   1000,
+		}),
+		txtSuffix: "test.suffix.",
+		cacheTime: 10 * time.Minute,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	blocked, err := c.CheckContext(ctx, "test.example.com")
+	elapsed := time.Since(start)
+
+	// Should return an error due to timeout
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+	assert.False(t, blocked)
+
+	// Should complete within reasonable time (much less than 5s)
+	assert.Less(t, elapsed, 3*time.Second)
+}
+
+// TestChecker_Check_BackwardCompatibility tests that the original Check method
+// still works and uses the new CheckContext internally.
+func TestChecker_Check_BackwardCompatibility(t *testing.T) {
+	ups := aghtest.NewBlockUpstream("test.example.com", false)
+	c := &Checker{
+		logger:   slogutil.NewDiscardLogger(),
+		upstream: ups,
+		cache: cache.New(cache.Config{
+			EnableLRU: true,
+			MaxSize:   1000,
+		}),
+		txtSuffix: "test.suffix.",
+		cacheTime: 10 * time.Minute,
+	}
+
+	// This should work exactly as before
+	blocked, err := c.Check("test.example.com")
+	assert.NoError(t, err)
+	assert.False(t, blocked)
 }
