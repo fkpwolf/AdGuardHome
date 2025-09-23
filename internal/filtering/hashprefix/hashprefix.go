@@ -102,6 +102,11 @@ func New(conf *Config) (c *Checker) {
 	}
 }
 
+// Close closes the underlying upstream connection.
+func (c *Checker) Close() error {
+	return c.upstream.Close()
+}
+
 // Check returns true if request for the host should be blocked.
 func (c *Checker) Check(host string) (ok bool, err error) {
 	ctx := context.TODO()
