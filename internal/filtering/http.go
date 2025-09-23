@@ -578,6 +578,12 @@ func (d *DNSFilter) handleSafeBrowsingEnable(w http.ResponseWriter, r *http.Requ
 // /control/safebrowsing/disable HTTP API.
 func (d *DNSFilter) handleSafeBrowsingDisable(w http.ResponseWriter, r *http.Request) {
 	setProtectedBool(d.confMu, &d.conf.SafeBrowsingEnabled, false)
+	
+	// Close idle connections to prevent connection leaks when safe browsing is disabled
+	if d.safeBrowsingChecker != nil {
+		d.safeBrowsingChecker.CloseIdleConnections()
+	}
+	
 	d.conf.ConfModifier.Apply(r.Context())
 }
 
@@ -604,6 +610,12 @@ func (d *DNSFilter) handleParentalEnable(w http.ResponseWriter, r *http.Request)
 // HTTP API.
 func (d *DNSFilter) handleParentalDisable(w http.ResponseWriter, r *http.Request) {
 	setProtectedBool(d.confMu, &d.conf.ParentalEnabled, false)
+	
+	// Close idle connections to prevent connection leaks when parental control is disabled
+	if d.parentalControlChecker != nil {
+		d.parentalControlChecker.CloseIdleConnections()
+	}
+	
 	d.conf.ConfModifier.Apply(r.Context())
 }
 

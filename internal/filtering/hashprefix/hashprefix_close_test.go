@@ -42,3 +42,24 @@ func TestChecker_Close(t *testing.T) {
 	// Ensure the upstream was closed
 	assert.True(t, closed)
 }
+
+func TestChecker_CloseIdleConnections(t *testing.T) {
+	ups := &aghtest.UpstreamMock{
+		OnAddress: func() (addr string) { return "upstream.example" },
+		OnExchange: func(_ *dns.Msg) (resp *dns.Msg, err error) {
+			return nil, nil
+		},
+		OnClose: func() (err error) { return nil },
+	}
+
+	c := New(&Config{
+		Logger:    slog.Default(),
+		Upstream:  ups,
+		TXTSuffix: "test.example",
+		CacheTime: 10 * time.Second,
+		CacheSize: 100,
+	})
+
+	// CloseIdleConnections should not panic even if upstream doesn't support it
+	assert.NotPanics(t, c.CloseIdleConnections)
+}

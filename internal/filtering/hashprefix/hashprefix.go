@@ -107,6 +107,14 @@ func (c *Checker) Close() error {
 	return c.upstream.Close()
 }
 
+// CloseIdleConnections closes idle connections if the upstream supports it.
+// This can help reduce connection leaks when the checker is not actively used.
+func (c *Checker) CloseIdleConnections() {
+	if closer, ok := c.upstream.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
 // Check returns true if request for the host should be blocked.
 func (c *Checker) Check(host string) (ok bool, err error) {
 	ctx := context.TODO()

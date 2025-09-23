@@ -240,6 +240,8 @@ type Checker interface {
 	Check(host string) (block bool, err error)
 	// Close closes the underlying upstream connection.
 	Close() error
+	// CloseIdleConnections closes idle connections if supported.
+	CloseIdleConnections()
 }
 
 // DNSFilter matches hostnames and DNS requests against filtering rules.
