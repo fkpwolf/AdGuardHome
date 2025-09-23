@@ -238,6 +238,9 @@ type hostChecker struct {
 type Checker interface {
 	// Check returns true if request for the host should be blocked.
 	Check(host string) (block bool, err error)
+
+	// Close closes the underlying connection resources.
+	Close() (err error)
 }
 
 // DNSFilter matches hostnames and DNS requests against filtering rules.
@@ -479,6 +482,18 @@ func (d *DNSFilter) reset(ctx context.Context) {
 	if d.rulesStorageAllow != nil {
 		if err := d.rulesStorageAllow.Close(); err != nil {
 			d.logger.ErrorContext(ctx, "closing allow rules storage", slogutil.KeyError, err)
+		}
+	}
+
+	if d.safeBrowsingChecker != nil {
+		if err := d.safeBrowsingChecker.Close(); err != nil {
+			d.logger.ErrorContext(ctx, "closing safe browsing checker", slogutil.KeyError, err)
+		}
+	}
+
+	if d.parentalControlChecker != nil {
+		if err := d.parentalControlChecker.Close(); err != nil {
+			d.logger.ErrorContext(ctx, "closing parental control checker", slogutil.KeyError, err)
 		}
 	}
 }
