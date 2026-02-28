@@ -82,16 +82,16 @@ type Checker struct {
 	// cache stores hostname hashes.
 	cache cache.Cache
 
+	// sf is used to deduplicate concurrent upstream requests for the same
+	// question, preventing a thundering herd against the upstream server
+	// when many DNS queries arrive simultaneously for hosts not yet cached.
+	sf singleflight.Group
+
 	// txtSuffix is the TXT suffix for DNS request.
 	txtSuffix string
 
 	// cacheTime is the time period to store hash.
 	cacheTime time.Duration
-
-	// sf is used to deduplicate concurrent upstream requests for the same
-	// question, preventing a thundering herd against the upstream server
-	// when many DNS queries arrive simultaneously for hosts not yet cached.
-	sf singleflight.Group
 }
 
 // New returns Checker.
@@ -111,8 +111,8 @@ func New(conf *Config) (c *Checker) {
 // checkResult is the internal result type used by singleflight to return
 // both the matched status and the received hashes.
 type checkResult struct {
-	matched        bool
 	receivedHashes []hostnameHash
+	matched        bool
 }
 
 // Check returns true if request for the host should be blocked.
