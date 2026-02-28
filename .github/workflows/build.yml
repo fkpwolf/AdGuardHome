@@ -99,6 +99,13 @@
       # to know about the master branch, while the version script uses it to
       # count the number of commits within the branch.
       'run': 'make SIGN=0 VERBOSE=1 VERSION="v0.0.0-github" ARCH=riscv64 OS=linux build-release'
+    - 'name': 'Upload build package'
+      'uses': 'actions/upload-artifact@v4'
+      'with':
+        'name': 'adguardhome-build-${{ github.sha }}'
+        'path': 'dist/'
+        'if-no-files-found': 'error'
+        'retention-days': 30
 
   'notify':
     'needs':
