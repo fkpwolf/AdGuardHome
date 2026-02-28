@@ -18,6 +18,7 @@ import (
 	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/miekg/dns"
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -81,6 +82,11 @@ type Checker struct {
 	// cache stores hostname hashes.
 	cache cache.Cache
 
+	// sf is used to deduplicate concurrent upstream requests for the same
+	// question, preventing a thundering herd against the upstream server
+	// when many DNS queries arrive simultaneously for hosts not yet cached.
+	sf singleflight.Group
+
 	// txtSuffix is the TXT suffix for DNS request.
 	txtSuffix string
 
@@ -102,6 +108,13 @@ func New(conf *Config) (c *Checker) {
 	}
 }
 
+// checkResult is the internal result type used by singleflight to return
+// both the matched status and the received hashes.
+type checkResult struct {
+	receivedHashes []hostnameHash
+	matched        bool
+}
+
 // Check returns true if request for the host should be blocked.
 func (c *Checker) Check(host string) (ok bool, err error) {
 	ctx := context.TODO()
@@ -120,18 +133,38 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 	question := c.getQuestion(hashesToRequest)
 
 	l.DebugContext(ctx, "checking", "question", question)
-	req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
 
-	resp, err := c.upstream.Exchange(req)
+	// Use singleflight to deduplicate concurrent upstream requests for the
+	// same question.  This prevents a thundering herd of goroutines from all
+	// sending separate DoH requests when the upstream is slow or degraded.
+	v, err, shared := c.sf.Do(question, func() (any, error) {
+		req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
+
+		resp, exchErr := c.upstream.Exchange(req)
+		if exchErr != nil {
+			return nil, fmt.Errorf("getting hashes: %w", exchErr)
+		}
+
+		matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
+
+		c.storeInCache(ctx, hashesToRequest, receivedHashes)
+
+		return checkResult{matched: matched, receivedHashes: receivedHashes}, nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("getting hashes: %w", err)
+		return false, err
 	}
 
-	matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
+	if shared {
+		l.DebugContext(ctx, "singleflight: reused upstream result")
+	}
 
-	c.storeInCache(ctx, hashesToRequest, receivedHashes)
+	result, ok := v.(checkResult)
+	if !ok {
+		return false, fmt.Errorf("unexpected singleflight result type %T", v)
+	}
 
-	return matched, nil
+	return result.matched, nil
 }
 
 // hostnameToHashes returns hashes that should be checked by the hash prefix
