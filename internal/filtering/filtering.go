@@ -242,6 +242,10 @@ type hostChecker struct {
 type Checker interface {
 	// Check returns true if request for the host should be blocked.
 	Check(host string) (block bool, err error)
+	
+	// CheckContext returns true if request for the host should be blocked.
+	// The context is used for timeout control of upstream requests.
+	CheckContext(ctx context.Context, host string) (block bool, err error)
 }
 
 // DNSFilter matches hostnames and DNS requests against filtering rules.
@@ -1139,7 +1143,9 @@ func (d *DNSFilter) checkSafeBrowsing(
 		return Result{}, nil
 	}
 
-	ctx := context.TODO()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
 	if d.logger.Enabled(ctx, slogutil.LevelDebug) {
 		startTime := time.Now()
 		defer func() {
@@ -1157,7 +1163,7 @@ func (d *DNSFilter) checkSafeBrowsing(
 		IsFiltered: true,
 	}
 
-	block, err := d.safeBrowsingChecker.Check(host)
+	block, err := d.safeBrowsingChecker.CheckContext(ctx, host)
 	if !block || err != nil {
 		return Result{}, err
 	}
@@ -1175,7 +1181,9 @@ func (d *DNSFilter) checkParental(
 		return Result{}, nil
 	}
 
-	ctx := context.TODO()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
 	if d.logger.Enabled(ctx, slogutil.LevelDebug) {
 		startTime := time.Now()
 		defer func() {
@@ -1193,7 +1201,7 @@ func (d *DNSFilter) checkParental(
 		IsFiltered: true,
 	}
 
-	block, err := d.parentalControlChecker.Check(host)
+	block, err := d.parentalControlChecker.CheckContext(ctx, host)
 	if !block || err != nil {
 		return Result{}, err
 	}
