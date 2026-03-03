@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -29,6 +30,13 @@ const (
 
 	// hexSize is the size of hexadecimal representation of hashed hostname.
 	hexSize = hashSize * 2
+
+	// upstreamErrCooldown is the minimum time between upstream exchange
+	// attempts after a failed exchange.  It prevents connection storms when
+	// the upstream server is temporarily unavailable: after a failure, all
+	// concurrent callers skip the exchange and fail open (pass-through),
+	// avoiding repeated HTTP-client resets inside the DoH transport.
+	upstreamErrCooldown = 1 * time.Second
 )
 
 // prefix is the type of the SHA256 hash prefix used to match against the
@@ -86,6 +94,15 @@ type Checker struct {
 
 	// cacheTime is the time period to store hash.
 	cacheTime time.Duration
+
+	// mu protects upstreamLastErrTime.
+	mu sync.RWMutex
+
+	// upstreamLastErrTime is the time of the most recent upstream exchange
+	// error.  When non-zero and within upstreamErrCooldown, subsequent calls
+	// skip the upstream and return false with no error (fail-open) to prevent
+	// connection storms.
+	upstreamLastErrTime time.Time
 }
 
 // New returns Checker.
@@ -117,15 +134,42 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 		return blocked, nil
 	}
 
+	// If the upstream had a recent error, skip the exchange to prevent
+	// connection storms.  Return false (pass-through / fail-open), which is
+	// the same outcome the caller gets on any exchange error.
+	c.mu.RLock()
+	lastErrTime := c.upstreamLastErrTime
+	c.mu.RUnlock()
+
+	if !lastErrTime.IsZero() && time.Since(lastErrTime) < upstreamErrCooldown {
+		return false, nil
+	}
+
 	question := c.getQuestion(hashesToRequest)
 
 	l.DebugContext(ctx, "checking", "question", question)
 	req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
 
+	// Record the start time so that we can avoid overwriting a more recent
+	// concurrent error when clearing the error timestamp on success.
+	exchangeStart := time.Now()
+
 	resp, err := c.upstream.Exchange(req)
 	if err != nil {
+		c.mu.Lock()
+		c.upstreamLastErrTime = time.Now()
+		c.mu.Unlock()
+
 		return false, fmt.Errorf("getting hashes: %w", err)
 	}
+
+	c.mu.Lock()
+	// Only clear the error timestamp if it predates this successful exchange,
+	// to avoid overwriting a concurrent error that occurred more recently.
+	if c.upstreamLastErrTime.Before(exchangeStart) {
+		c.upstreamLastErrTime = time.Time{}
+	}
+	c.mu.Unlock()
 
 	matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
 

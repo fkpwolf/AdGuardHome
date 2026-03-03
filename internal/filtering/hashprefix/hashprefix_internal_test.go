@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -255,4 +256,55 @@ func TestChecker_Check(t *testing.T) {
 			assert.Equal(t, 1, numReq)
 		})
 	}
+}
+
+// TestChecker_Check_UpstreamErrCooldown verifies that after a failed upstream
+// exchange, subsequent Check calls within the cooldown window skip the upstream
+// and return false/nil (fail-open), limiting connection churn when the upstream
+// is unstable.
+func TestChecker_Check_UpstreamErrCooldown(t *testing.T) {
+	const hostname = "example.org"
+
+	var numExchanges atomic.Int32
+
+	errUps := aghtest.NewErrorUpstream()
+	origExchange := errUps.OnExchange
+	errUps.OnExchange = func(req *dns.Msg) (resp *dns.Msg, err error) {
+		numExchanges.Add(1)
+
+		return origExchange(req)
+	}
+
+	c := New(&Config{
+		Logger:    testLogger,
+		Upstream:  errUps,
+		CacheTime: cacheTime,
+		CacheSize: cacheSize,
+	})
+
+	// First call should reach the upstream and fail.
+	blocked, err := c.Check(hostname)
+	require.Error(t, err)
+	assert.False(t, blocked)
+	assert.Equal(t, int32(1), numExchanges.Load())
+
+	// Subsequent calls within the cooldown window must NOT call the upstream.
+	blocked, err = c.Check(hostname)
+	require.NoError(t, err)
+	assert.False(t, blocked)
+
+	blocked, err = c.Check(hostname)
+	require.NoError(t, err)
+	assert.False(t, blocked)
+
+	// Upstream was only called once despite multiple Check invocations.
+	assert.Equal(t, int32(1), numExchanges.Load())
+
+	// After the cooldown expires, the upstream should be tried again.
+	time.Sleep(upstreamErrCooldown + 10*time.Millisecond)
+
+	blocked, err = c.Check(hostname)
+	require.Error(t, err)
+	assert.False(t, blocked)
+	assert.Equal(t, int32(2), numExchanges.Load())
 }
