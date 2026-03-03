@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,4 +256,90 @@ func TestChecker_Check(t *testing.T) {
 			assert.Equal(t, 1, numReq)
 		})
 	}
+}
+
+// TestChecker_Check_SamePrefixConcurrent verifies that two goroutines querying
+// different hostnames that share the same 2-byte SHA256 prefix each receive an
+// independent, correct result even when they share a single upstream request
+// through singleflight.
+//
+// "act.org" and "ahy.org" both produce SHA256 hashes starting with 0x58e3,
+// so they generate the same DNS question string and can coalesce in singleflight.
+// The upstream returns only the hash of the blocked hostname; the innocent
+// hostname must NOT be reported as blocked.
+func TestChecker_Check_SamePrefixConcurrent(t *testing.T) {
+	const (
+		blockedHost  = "act.org"
+		innocentHost = "ahy.org"
+	)
+
+	blockedHash := sha256.Sum256([]byte(blockedHost))
+	blockedHashStr := hex.EncodeToString(blockedHash[:])
+
+	// ready is closed when the upstream receives its first request,
+	// confirming that goroutine 1 is blocked inside sf.Do.
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+
+	// gate is closed to release the upstream response.
+	gate := make(chan struct{})
+
+	ups := aghtest.NewUpstreamMock(func(req *dns.Msg) (resp *dns.Msg, err error) {
+		readyOnce.Do(func() { close(ready) })
+		<-gate
+
+		resp = new(dns.Msg).SetReply(req)
+		resp.Answer = []dns.RR{&dns.TXT{
+			Hdr: dns.RR_Header{
+				Name:   req.Question[0].Name,
+				Rrtype: dns.TypeTXT,
+				Class:  dns.ClassINET,
+				Ttl:    60,
+			},
+			Txt: []string{blockedHashStr},
+		}}
+
+		return resp, nil
+	})
+
+	c := New(&Config{
+		Logger:    testLogger,
+		CacheTime: cacheTime,
+		CacheSize: cacheSize,
+	})
+	c.upstream = ups
+
+	var (
+		blockedResult, innocentResult bool
+		blockedErr, innocentErr       error
+		wg                            sync.WaitGroup
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		blockedResult, blockedErr = c.Check(blockedHost)
+	}()
+
+	// Wait until goroutine 1 is confirmed inside the upstream call (and
+	// therefore inside sf.Do), so the gate holds it there.
+	<-ready
+
+	// Goroutine 1 is now blocked; start goroutine 2 and let it enter sf.Do.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		innocentResult, innocentErr = c.Check(innocentHost)
+	}()
+
+	// Give goroutine 2 time to enter sf.Do before releasing goroutine 1.
+	time.Sleep(10 * time.Millisecond)
+	close(gate)
+
+	wg.Wait()
+
+	require.NoError(t, blockedErr)
+	require.NoError(t, innocentErr)
+	assert.True(t, blockedResult, "blocked host must be blocked")
+	assert.False(t, innocentResult, "innocent host with same prefix must not be blocked")
 }

@@ -108,11 +108,14 @@ func New(conf *Config) (c *Checker) {
 	}
 }
 
-// checkResult is the internal result type used by singleflight to return
-// both the matched status and the received hashes.
+// checkResult is the internal result type used by singleflight to share the
+// hashes received from the upstream across waiting goroutines.  matched is
+// intentionally not included: each goroutine must evaluate findMatch against
+// its own hashesToRequest, because different goroutines can produce the same
+// DNS question (same 2-byte prefix) while querying entirely different
+// hostnames.
 type checkResult struct {
 	receivedHashes []hostnameHash
-	matched        bool
 }
 
 // Check returns true if request for the host should be blocked.
@@ -145,11 +148,11 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 			return nil, fmt.Errorf("getting hashes: %w", exchErr)
 		}
 
-		matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
+		_, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
 
 		c.storeInCache(ctx, hashesToRequest, receivedHashes)
 
-		return checkResult{matched: matched, receivedHashes: receivedHashes}, nil
+		return checkResult{receivedHashes: receivedHashes}, nil
 	})
 	if err != nil {
 		return false, err
@@ -164,7 +167,12 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 		return false, fmt.Errorf("unexpected singleflight result type %T", v)
 	}
 
-	return result.matched, nil
+	// Each goroutine must compute its own match result because goroutines
+	// sharing a singleflight call may be checking different hostnames that
+	// happen to map to the same 2-byte hash prefix (and therefore the same
+	// DNS question).  Returning the winner's matched boolean would give a
+	// wrong answer to any waiter whose full hash is different.
+	return findMatch(hashesToRequest, result.receivedHashes), nil
 }
 
 // hostnameToHashes returns hashes that should be checked by the hash prefix
