@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -18,6 +19,7 @@ import (
 	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/miekg/dns"
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -29,6 +31,13 @@ const (
 
 	// hexSize is the size of hexadecimal representation of hashed hostname.
 	hexSize = hashSize * 2
+
+	// upstreamErrCooldown is the minimum time between upstream exchange
+	// attempts after a failed exchange.  It prevents connection storms when
+	// the upstream server is temporarily unavailable: after a failure, all
+	// concurrent callers skip the exchange and fail open (pass-through),
+	// avoiding repeated HTTP-client resets inside the DoH transport.
+	upstreamErrCooldown = 1 * time.Second
 )
 
 // prefix is the type of the SHA256 hash prefix used to match against the
@@ -86,6 +95,23 @@ type Checker struct {
 
 	// cacheTime is the time period to store hash.
 	cacheTime time.Duration
+
+	// mu protects upstreamLastErrTime.
+	mu sync.RWMutex
+
+	// upstreamLastErrTime is the time of the most recent upstream exchange
+	// error.  When non-zero and within upstreamErrCooldown, subsequent calls
+	// skip the upstream and return false with no error (fail-open) to prevent
+	// connection storms.
+	upstreamLastErrTime time.Time
+
+	// sf deduplicates concurrent upstream exchanges for the same DNS
+	// question.  When multiple Check calls arrive for the same (or
+	// hash-prefix-equivalent) host simultaneously, only one Exchange is
+	// issued and its result is shared with all waiters.  This prevents
+	// connection pool exhaustion when the upstream is slow or when many
+	// goroutines query the same domain at once.
+	sf singleflight.Group
 }
 
 // New returns Checker.
@@ -117,15 +143,61 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 		return blocked, nil
 	}
 
+	// If the upstream had a recent error, skip the exchange to prevent
+	// connection storms.  Return false (pass-through / fail-open), which is
+	// the same outcome the caller gets on any exchange error.
+	c.mu.RLock()
+	lastErrTime := c.upstreamLastErrTime
+	c.mu.RUnlock()
+
+	if !lastErrTime.IsZero() && time.Since(lastErrTime) < upstreamErrCooldown {
+		return false, nil
+	}
+
 	question := c.getQuestion(hashesToRequest)
 
 	l.DebugContext(ctx, "checking", "question", question)
 	req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
 
-	resp, err := c.upstream.Exchange(req)
-	if err != nil {
-		return false, fmt.Errorf("getting hashes: %w", err)
+	// Record the start time so that we can avoid overwriting a more recent
+	// concurrent error when clearing the error timestamp on success.
+	exchangeStart := time.Now()
+
+	// Deduplicate concurrent upstream exchanges for the same question.
+	// Multiple goroutines querying the same or hash-prefix-equivalent host
+	// simultaneously all share one Exchange call and its result.  This
+	// prevents extra connections and repeated resetClient calls when the
+	// upstream is slow or when a burst of requests for the same domain
+	// arrives before the cache is populated.
+	v, sfErr, _ := c.sf.Do(question, func() (any, error) {
+		resp, err := c.upstream.Exchange(req)
+		if err != nil {
+			c.mu.Lock()
+			c.upstreamLastErrTime = time.Now()
+			c.mu.Unlock()
+
+			return nil, err
+		}
+
+		c.mu.Lock()
+		// Only clear the error timestamp if it predates this successful
+		// exchange, to avoid overwriting a concurrent error that occurred
+		// more recently.
+		if c.upstreamLastErrTime.Before(exchangeStart) {
+			c.upstreamLastErrTime = time.Time{}
+		}
+		c.mu.Unlock()
+
+		return resp, nil
+	})
+	if sfErr != nil {
+		return false, fmt.Errorf("getting hashes: %w", sfErr)
 	}
+
+	// resp is guaranteed non-nil when sfErr == nil: the singleflight
+	// function only returns (nil, nil) if the upstream returned (nil, nil),
+	// which is not a valid upstream.Exchange response.
+	resp, _ := v.(*dns.Msg)
 
 	matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
 
