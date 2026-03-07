@@ -343,3 +343,40 @@ func TestChecker_Check_SamePrefixConcurrent(t *testing.T) {
 	assert.True(t, blockedResult, "blocked host must be blocked")
 	assert.False(t, innocentResult, "innocent host with same prefix must not be blocked")
 }
+
+// TestChecker_Check_SlowUpstream verifies that Check fails open (returns
+// false, nil) when the upstream hangs longer than CheckTimeout.  This prevents
+// the DNS service from freezing when the upstream is slow or unreachable.
+func TestChecker_Check_SlowUpstream(t *testing.T) {
+	const (
+		timeout = 100 * time.Millisecond
+		host    = "example.org"
+	)
+
+	// block keeps the upstream hanging until we release it after the test.
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+
+	ups := aghtest.NewUpstreamMock(func(req *dns.Msg) (resp *dns.Msg, err error) {
+		<-block
+
+		return new(dns.Msg).SetReply(req), nil
+	})
+
+	c := New(&Config{
+		Logger:       testLogger,
+		CacheTime:    cacheTime,
+		CacheSize:    cacheSize,
+		CheckTimeout: timeout,
+	})
+	c.upstream = ups
+
+	start := time.Now()
+	blocked, err := c.Check(host)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.False(t, blocked, "must fail open when upstream times out")
+	assert.GreaterOrEqual(t, elapsed, timeout, "must wait at least CheckTimeout")
+	assert.Less(t, elapsed, 5*timeout, "must return promptly after CheckTimeout")
+}
