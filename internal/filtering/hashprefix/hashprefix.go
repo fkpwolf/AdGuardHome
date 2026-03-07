@@ -18,6 +18,7 @@ import (
 	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/miekg/dns"
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -29,6 +30,12 @@ const (
 
 	// hexSize is the size of hexadecimal representation of hashed hostname.
 	hexSize = hashSize * 2
+
+	// defaultCheckTimeout is the default maximum time a goroutine waits for a
+	// singleflight upstream result before giving up and failing open.  It
+	// prevents the DNS service from freezing when the upstream is slow or
+	// unreachable.
+	defaultCheckTimeout = 10 * time.Second
 )
 
 // prefix is the type of the SHA256 hash prefix used to match against the
@@ -69,6 +76,11 @@ type Config struct {
 	// CacheSize is the maximum size of the cache.  If it's zero, cache size is
 	// unlimited.
 	CacheSize uint
+
+	// CheckTimeout is the maximum time to wait for a singleflight upstream
+	// result before giving up and failing open (treating the host as not
+	// blocked).  If zero, defaultCheckTimeout is used.
+	CheckTimeout time.Duration
 }
 
 type Checker struct {
@@ -81,25 +93,50 @@ type Checker struct {
 	// cache stores hostname hashes.
 	cache cache.Cache
 
+	// sf is used to deduplicate concurrent upstream requests for the same
+	// question, preventing a thundering herd against the upstream server
+	// when many DNS queries arrive simultaneously for hosts not yet cached.
+	sf singleflight.Group
+
 	// txtSuffix is the TXT suffix for DNS request.
 	txtSuffix string
 
 	// cacheTime is the time period to store hash.
 	cacheTime time.Duration
+
+	// checkTimeout is the maximum time a goroutine waits for a singleflight
+	// upstream result before failing open.
+	checkTimeout time.Duration
 }
 
 // New returns Checker.
 func New(conf *Config) (c *Checker) {
+	checkTimeout := conf.CheckTimeout
+	if checkTimeout == 0 {
+		checkTimeout = defaultCheckTimeout
+	}
+
 	return &Checker{
-		logger:   conf.Logger,
+		logger: conf.Logger,
 		upstream: conf.Upstream,
 		cache: cache.New(cache.Config{
 			EnableLRU: true,
 			MaxSize:   conf.CacheSize,
 		}),
-		txtSuffix: conf.TXTSuffix,
-		cacheTime: conf.CacheTime,
+		txtSuffix:    conf.TXTSuffix,
+		cacheTime:    conf.CacheTime,
+		checkTimeout: checkTimeout,
 	}
+}
+
+// checkResult is the internal result type used by singleflight to share the
+// hashes received from the upstream across waiting goroutines.  matched is
+// intentionally not included: each goroutine must evaluate findMatch against
+// its own hashesToRequest, because different goroutines can produce the same
+// DNS question (same 2-byte prefix) while querying entirely different
+// hostnames.
+type checkResult struct {
+	receivedHashes []hostnameHash
 }
 
 // Check returns true if request for the host should be blocked.
@@ -120,18 +157,61 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 	question := c.getQuestion(hashesToRequest)
 
 	l.DebugContext(ctx, "checking", "question", question)
-	req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
 
-	resp, err := c.upstream.Exchange(req)
-	if err != nil {
-		return false, fmt.Errorf("getting hashes: %w", err)
+	// Use singleflight to deduplicate concurrent upstream requests for the
+	// same question.  This prevents a thundering herd of goroutines from all
+	// sending separate DoH requests when the upstream is slow or degraded.
+	ch := c.sf.DoChan(question, func() (any, error) {
+		req := (&dns.Msg{}).SetQuestion(question, dns.TypeTXT)
+
+		resp, exchErr := c.upstream.Exchange(req)
+		if exchErr != nil {
+			return nil, fmt.Errorf("getting hashes: %w", exchErr)
+		}
+
+		_, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
+
+		c.storeInCache(ctx, hashesToRequest, receivedHashes)
+
+		return checkResult{receivedHashes: receivedHashes}, nil
+	})
+
+	// Wait for the singleflight result, but don't block indefinitely.  If
+	// the upstream is slow or the connection pool is exhausted, fall back to
+	// fail-open so DNS queries remain responsive rather than stalling the
+	// entire service.
+	timer := time.NewTimer(c.checkTimeout)
+	defer timer.Stop()
+
+	var r singleflight.Result
+	select {
+	case r = <-ch:
+		// Got result within timeout; continue below.
+	case <-timer.C:
+		l.DebugContext(ctx, "singleflight: timed out waiting for upstream result, failing open")
+
+		return false, nil
 	}
 
-	matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
+	if r.Err != nil {
+		return false, r.Err
+	}
 
-	c.storeInCache(ctx, hashesToRequest, receivedHashes)
+	if r.Shared {
+		l.DebugContext(ctx, "singleflight: reused upstream result")
+	}
 
-	return matched, nil
+	result, ok := r.Val.(checkResult)
+	if !ok {
+		return false, fmt.Errorf("unexpected singleflight result type %T", r.Val)
+	}
+
+	// Each goroutine must compute its own match result because goroutines
+	// sharing a singleflight call may be checking different hostnames that
+	// happen to map to the same 2-byte hash prefix (and therefore the same
+	// DNS question).  Returning the winner's matched boolean would give a
+	// wrong answer to any waiter whose full hash is different.
+	return findMatch(hashesToRequest, result.receivedHashes), nil
 }
 
 // hostnameToHashes returns hashes that should be checked by the hash prefix
