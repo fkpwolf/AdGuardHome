@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,6 +257,65 @@ func TestChecker_Check(t *testing.T) {
 			assert.Equal(t, 1, numReq)
 		})
 	}
+}
+
+// TestChecker_Check_UpstreamInFlight verifies that concurrent Check calls for
+// the same host share a single upstream Exchange via singleflight and all
+// receive the same (correct) result, rather than each issuing its own Exchange.
+func TestChecker_Check_UpstreamInFlight(t *testing.T) {
+	const hostname = "example.org"
+
+	var numExchanges atomic.Int32
+
+	// blockCh blocks the Exchange until we release it, simulating a slow
+	// upstream.
+	blockCh := make(chan struct{})
+
+	c := New(&Config{
+		Logger: testLogger,
+		Upstream: aghtest.NewUpstreamMock(func(_ *dns.Msg) (resp *dns.Msg, err error) {
+			numExchanges.Add(1)
+			<-blockCh
+
+			return nil, aghtest.ErrUpstream
+		}),
+		CacheTime: cacheTime,
+		CacheSize: cacheSize,
+	})
+
+	// Launch two concurrent goroutines that both check the same host while
+	// the upstream is blocked.  Singleflight should issue only one Exchange.
+	var wg sync.WaitGroup
+
+	results := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			_, results[idx] = c.Check(hostname)
+		}(i)
+	}
+
+	// Give both goroutines time to enter Check and reach the singleflight
+	// barrier before releasing the upstream.
+	time.Sleep(10 * time.Millisecond)
+
+	// Only one Exchange should have been started for both goroutines.
+	assert.Equal(t, int32(1), numExchanges.Load())
+
+	// Unblock the in-flight Exchange; both goroutines get the same result.
+	close(blockCh)
+	wg.Wait()
+
+	// Both should have received the upstream error (not nil — singleflight
+	// shares the real result, not fail-open).
+	for i, err := range results {
+		assert.ErrorIsf(t, err, aghtest.ErrUpstream, "goroutine %d", i)
+	}
+
+	// Exactly one Exchange was issued for two concurrent callers.
+	assert.Equal(t, int32(1), numExchanges.Load())
 }
 
 // TestChecker_Check_UpstreamErrCooldown verifies that after a failed upstream

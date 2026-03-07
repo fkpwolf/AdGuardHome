@@ -19,6 +19,7 @@ import (
 	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/miekg/dns"
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -103,6 +104,14 @@ type Checker struct {
 	// skip the upstream and return false with no error (fail-open) to prevent
 	// connection storms.
 	upstreamLastErrTime time.Time
+
+	// sf deduplicates concurrent upstream exchanges for the same DNS
+	// question.  When multiple Check calls arrive for the same (or
+	// hash-prefix-equivalent) host simultaneously, only one Exchange is
+	// issued and its result is shared with all waiters.  This prevents
+	// connection pool exhaustion when the upstream is slow or when many
+	// goroutines query the same domain at once.
+	sf singleflight.Group
 }
 
 // New returns Checker.
@@ -154,22 +163,41 @@ func (c *Checker) Check(host string) (ok bool, err error) {
 	// concurrent error when clearing the error timestamp on success.
 	exchangeStart := time.Now()
 
-	resp, err := c.upstream.Exchange(req)
-	if err != nil {
+	// Deduplicate concurrent upstream exchanges for the same question.
+	// Multiple goroutines querying the same or hash-prefix-equivalent host
+	// simultaneously all share one Exchange call and its result.  This
+	// prevents extra connections and repeated resetClient calls when the
+	// upstream is slow or when a burst of requests for the same domain
+	// arrives before the cache is populated.
+	v, sfErr, _ := c.sf.Do(question, func() (any, error) {
+		resp, err := c.upstream.Exchange(req)
+		if err != nil {
+			c.mu.Lock()
+			c.upstreamLastErrTime = time.Now()
+			c.mu.Unlock()
+
+			return nil, err
+		}
+
 		c.mu.Lock()
-		c.upstreamLastErrTime = time.Now()
+		// Only clear the error timestamp if it predates this successful
+		// exchange, to avoid overwriting a concurrent error that occurred
+		// more recently.
+		if c.upstreamLastErrTime.Before(exchangeStart) {
+			c.upstreamLastErrTime = time.Time{}
+		}
 		c.mu.Unlock()
 
-		return false, fmt.Errorf("getting hashes: %w", err)
+		return resp, nil
+	})
+	if sfErr != nil {
+		return false, fmt.Errorf("getting hashes: %w", sfErr)
 	}
 
-	c.mu.Lock()
-	// Only clear the error timestamp if it predates this successful exchange,
-	// to avoid overwriting a concurrent error that occurred more recently.
-	if c.upstreamLastErrTime.Before(exchangeStart) {
-		c.upstreamLastErrTime = time.Time{}
-	}
-	c.mu.Unlock()
+	// resp is guaranteed non-nil when sfErr == nil: the singleflight
+	// function only returns (nil, nil) if the upstream returned (nil, nil),
+	// which is not a valid upstream.Exchange response.
+	resp, _ := v.(*dns.Msg)
 
 	matched, receivedHashes := c.processAnswer(ctx, l, hashesToRequest, resp)
 
